@@ -1,0 +1,14 @@
+# Used by both the Streamlit app and the API.
+pandas>=2.2
+numpy
+scipy
+xarray
+netCDF4
+rasterio
+openpyxl
+xlrd
+requests
+streamlit
+fastapi
+uvicorn
+python-multipart
