@@ -611,8 +611,8 @@ elif st.session_state["path"] == "upload":
         st.markdown("### Step 3: Check Against Thresholds")
         st.markdown("Extract the expected 12-month precipitation threshold for your location based on Smith's (2023) interpolated raster data, rescaled for topography with CHPclim (Funk et al., 2015).")
         
-        tif_normal_path = "SPI12_0_v2.tif" 
-        tif_drought_path = "SPI12_NEG1_v2.tif"
+        tif_normal_path = "SPI12_0_v3.tif" 
+        tif_drought_path = "SPI12_NEG1_v3.tif"
 
         if st.button("Check Drought Status", type="primary"):
             if user_lat == 0.0 and user_lon == 0.0:
