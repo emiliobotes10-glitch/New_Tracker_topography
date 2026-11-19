@@ -187,7 +187,7 @@ if st.session_state["path"] is None:
         if st.button("Yes — Upload My Rainfall Data", use_container_width=True):
             st.session_state["path"] = "upload"
             st.rerun()
-        st.info("Upload a SAWS Excel file, or fill in the daily or monthly template for rainfall from any other source. Rainfall gauge data with pre-computed precipitation thresholds (Smith, 2023), rescaled for topography with CHPclim. Rainfall gauges SPI up to date to 2021 rainfall data.")
+        st.info("Upload a SAWS Excel file, or fill in the daily or monthly template for rainfall from any other source. Rainfall gauge data with pre-computed precipitation thresholds (Smith, 2023), rescaled for topography with the SANBI (2021) rainfall map. Rainfall gauges SPI up to date to 2021 rainfall data.")
             
     with col2:
         if st.button("No — Use CHIRPS Satellite Data", use_container_width=True):
@@ -210,7 +210,7 @@ elif st.session_state["path"] == "upload":
         pass
 
     st.title("Drought Tracker: Upload Rainfall Data")
-    st.markdown("### Notice: This application uses your 12-month cumulative rainfall to check for drought conditions based on pre-computed precipitation thresholds (Smith, 2023), rescaled for topography with CHPclim.")
+    st.markdown("### Notice: This application uses your 12-month cumulative rainfall to check for drought conditions based on pre-computed precipitation thresholds (Smith, 2023), rescaled for topography with the SANBI (2021) rainfall map.")
 
     st.markdown("#### Step 1: Enter your location")
     
@@ -609,10 +609,10 @@ elif st.session_state["path"] == "upload":
 
         st.markdown("---")
         st.markdown("### Step 3: Check Against Thresholds")
-        st.markdown("Extract the expected 12-month precipitation threshold for your location based on Smith's (2023) interpolated raster data, rescaled for topography with CHPclim (Funk et al., 2015).")
+        st.markdown("Extract the expected 12-month precipitation threshold for your location based on Smith's (2023) interpolated raster data, rescaled for topography with the SANBI (2021) rainfall map (Lötter & Le Maitre, 2021).")
         
-        tif_normal_path = "SPI12_0_v3.tif" 
-        tif_drought_path = "SPI12_NEG1_v3.tif"
+        tif_normal_path = "threshold_spi12_normal_ratio-sanbi2021_idw-all-p2.tif"
+        tif_drought_path = "threshold_spi12_drought_ratio-sanbi2021_idw-all-p2.tif"
 
         if st.button("Check Drought Status", type="primary"):
             if user_lat == 0.0 and user_lon == 0.0:
