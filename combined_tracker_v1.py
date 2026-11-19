@@ -176,6 +176,244 @@ def read_monthly_template(uploaded_file):
     data["Total_Monthly_Rain"], _, _ = clean_template_rain(data["Total_Monthly_Rain"])
     return data.sort_values("Month_Date").set_index("Month_Date")[["Total_Monthly_Rain"]]
 
+
+# ---------- Smith (2023) SDF return-period support ----------
+RETURN_PERIODS = [2, 5, 10, 20, 50, 100]
+MAX_SDF_DURATION = 24
+SDF_TABLE_PATH = "sdf_station_table.csv"
+
+@st.cache_data
+def load_sdf_table():
+    """Load the SANBI-scaled Smith SDF station ratios prepared from Folder 8."""
+    if not os.path.exists(SDF_TABLE_PATH):
+        raise FileNotFoundError(
+            f"{SDF_TABLE_PATH} is missing. Keep it in the same folder as this app."
+        )
+    table = pd.read_csv(SDF_TABLE_PATH)
+    required = {"Station", "Lat", "Long", "map_sanbi", "r_N", "r_D"}
+    missing = required.difference(table.columns)
+    if missing:
+        raise ValueError(f"SDF station table is missing columns: {sorted(missing)}")
+    if table["Station"].nunique() != len(table):
+        raise ValueError("SDF station table contains duplicate station IDs.")
+    if len(table) != 271:
+        raise ValueError(
+            f"Expected the retained 271 Smith stations, but found {len(table)}."
+        )
+    if (table["map_sanbi"] <= 0).any():
+        raise ValueError("SDF table contains invalid SANBI rainfall-map values.")
+    return table
+
+
+def great_circle_km(lat, lon, lats, lons):
+    """Vectorised haversine distances in kilometres."""
+    earth_radius_km = 6371.0088
+    lat1 = np.radians(float(lat))
+    lon1 = np.radians(float(lon))
+    lat2 = np.radians(np.asarray(lats, dtype=float))
+    lon2 = np.radians(np.asarray(lons, dtype=float))
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    return 2.0 * earth_radius_km * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+
+
+def local_sdf_spi(lat, lon, duration):
+    """
+    Interpolate SANBI-rainfall-map ratios from stations using IDW power 2.
+    For each return period, r_N, r_D and r_T use the same valid station set.
+    """
+    if not 1 <= int(duration) <= MAX_SDF_DURATION:
+        raise ValueError("SDF duration must be between 1 and 24 months.")
+
+    table = load_sdf_table()
+    distances = great_circle_km(lat, lon, table["Lat"], table["Long"])
+    nearest_idx = int(np.argmin(distances))
+
+    result = {}
+    for period in RETURN_PERIODS:
+        column = f"r_T{period}_d{int(duration)}"
+        if column not in table.columns:
+            continue
+
+        valid = (
+            np.isfinite(table[column].to_numpy(dtype=float))
+            & np.isfinite(table["r_N"].to_numpy(dtype=float))
+            & np.isfinite(table["r_D"].to_numpy(dtype=float))
+            & np.isfinite(distances)
+        )
+        if not valid.any():
+            continue
+
+        # Use the nearest station directly when the selected point is effectively
+        # at a gauge. Otherwise interpolate all ratios with IDW power 2.
+        if distances[nearest_idx] < 0.1 and valid[nearest_idx]:
+            r_n = float(table.iloc[nearest_idx]["r_N"])
+            r_d = float(table.iloc[nearest_idx]["r_D"])
+            r_t = float(table.iloc[nearest_idx][column])
+        else:
+            use_dist = distances[valid]
+            weights = 1.0 / np.maximum(use_dist, 1e-9) ** 2
+            weights /= weights.sum()
+            r_n = float(np.sum(weights * table.loc[valid, "r_N"].to_numpy(dtype=float)))
+            r_d = float(np.sum(weights * table.loc[valid, "r_D"].to_numpy(dtype=float)))
+            r_t = float(np.sum(weights * table.loc[valid, column].to_numpy(dtype=float)))
+
+        denominator = r_n - r_d
+        if denominator <= 0:
+            continue
+        spi_value = (r_t - r_n) / denominator
+
+        # Smith's fitted 1-in-T value can be above normal for long durations.
+        # Such a value is not a drought threshold and is omitted.
+        if np.isfinite(spi_value) and spi_value < 0:
+            result[period] = spi_value
+
+    return result
+
+
+def estimate_return_period(user_spi, spi_thresholds):
+    """Estimate return period by linear interpolation in log(return-period) space."""
+    periods = sorted(spi_thresholds)
+    if not periods:
+        return None, None, None
+
+    if user_spi >= spi_thresholds[periods[0]]:
+        return "below", periods[0], None
+    if user_spi <= spi_thresholds[periods[-1]]:
+        return "above", periods[-1], None
+
+    for t_low, t_high in zip(periods[:-1], periods[1:]):
+        if spi_thresholds[t_low] >= user_spi > spi_thresholds[t_high]:
+            denominator = spi_thresholds[t_low] - spi_thresholds[t_high]
+            if denominator == 0:
+                return "within", float(t_low), (t_low, t_high)
+            fraction = (spi_thresholds[t_low] - user_spi) / denominator
+            estimate = np.exp(
+                np.log(t_low) + fraction * (np.log(t_high) - np.log(t_low))
+            )
+            return "within", float(estimate), (t_low, t_high)
+
+    return None, None, None
+
+
+def smith_drought_duration(values_newest_first, below_normal, in_drought):
+    """
+    Smith event definition: drought begins when SPI < -1 and continues while
+    conditions remain below normal (SPI < 0). Values must be newest first.
+    """
+    run = []
+    stopped_by = "record_start"
+    for value in values_newest_first:
+        if pd.isna(value):
+            stopped_by = "gap"
+            break
+        if not below_normal(value):
+            stopped_by = "normal"
+            break
+        run.append(value)
+
+    drought_positions = [i for i, value in enumerate(run) if in_drought(value)]
+    if not drought_positions:
+        return None
+
+    onset = max(drought_positions)
+    duration = onset + 1
+    at_least = stopped_by != "normal"
+    return duration, at_least
+
+
+def show_sdf_result(duration, duration_used, at_least, user_mm,
+                    depth_mm, verdict, units):
+    """Display fitted Smith SDF return-period estimates."""
+    st.markdown("#### How rare is this drought? (Smith, 2023 SDF fitted values)")
+    st.write(
+        "**Drought duration (from the first month below the drought threshold, SPI-12 < -1):** "
+        f"{'at least ' if at_least else ''}{duration} months"
+    )
+    if duration > MAX_SDF_DURATION:
+        st.caption(
+            "Smith's fitted SDF values cover durations up to 24 months; "
+            "the most recent 24 months are assessed."
+        )
+
+    st.write(
+        f"**Average 12-month rainfall over the assessed drought period:** "
+        f"{user_mm:.1f} {units}"
+    )
+
+    if depth_mm:
+        rows = [
+            {"Return period": f"1 in {period} years",
+             f"Fitted 12-month rainfall depth ({duration_used}-month drought)": f"{depth_mm[period]:.1f} mm"}
+            for period in RETURN_PERIODS if period in depth_mm
+        ]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    kind, estimate, bounds = verdict
+    if kind == "below":
+        st.info(
+            f"More common than a 1-in-{estimate:g}-year event for this duration."
+        )
+    elif kind == "above":
+        st.error(
+            f"Rarer than a 1-in-{estimate:g}-year event for this duration."
+        )
+    elif kind == "within" and bounds:
+        low, high = bounds
+        st.warning(
+            f"Estimated at about a 1-in-{estimate:.0f}-year event "
+            f"(between 1 in {low} and 1 in {high} years)."
+        )
+    else:
+        st.warning("A return-period estimate could not be calculated for this duration.")
+
+    if at_least:
+        st.caption(
+            "The event reaches a data gap or the beginning of the available record. "
+            "It may have started earlier, so the actual duration and rarity may be greater."
+        )
+    st.caption(
+        "Based on Smith (2023) fitted values at the retained 271 stations, "
+        "interpolated using the SANBI (2021) rainfall-map ratio method and "
+        "IDW power 2. Long return-period estimates, particularly beyond about "
+        "50 years, are uncertain."
+    )
+
+
+def run_sdf_assessment(lat, lon, series_newest_first, below_normal,
+                       in_drought, user_spi, user_mm, threshold_normal,
+                       threshold_drought, units):
+    """Shared SDF assessment for gauge and CHIRPS pathways."""
+    result = smith_drought_duration(
+        series_newest_first, below_normal=below_normal, in_drought=in_drought
+    )
+    if result is None:
+        return
+
+    duration, at_least = result
+    duration_used = min(duration, MAX_SDF_DURATION)
+    spi_thresholds = local_sdf_spi(lat, lon, duration_used)
+    if not spi_thresholds:
+        st.warning(
+            "The SDF return-period assessment is unavailable at this location "
+            "and duration because no valid fitted station values were available."
+        )
+        return
+
+    depth_mm = {
+        period: threshold_normal
+        + spi_value * (threshold_normal - threshold_drought)
+        for period, spi_value in spi_thresholds.items()
+    }
+    user_spi_value = user_spi(duration_used) if callable(user_spi) else float(user_spi)
+    user_mm_value = user_mm(duration_used) if callable(user_mm) else float(user_mm)
+    verdict = estimate_return_period(user_spi_value, spi_thresholds)
+    show_sdf_result(
+        duration, duration_used, at_least, user_mm_value, depth_mm, verdict, units
+    )
+
+
 # ---------- Landing page ----------
 if st.session_state["path"] is None:
     st.title("Are You In A Drought?")
@@ -899,6 +1137,33 @@ elif st.session_state["path"] == "upload":
                                             "the true duration is likely longer."
                                         )
 
+                                # Smith SDF return-period assessment for the gauge/upload path.
+                                gauge_series = (
+                                    monthly_stats.loc[:valid_sum_idx, "Rolling_12_Month_Rainfall"]
+                                    .iloc[::-1]
+                                )
+                                if threshold_normal > threshold_drought:
+                                    try:
+                                        run_sdf_assessment(
+                                            user_lat, user_lon, gauge_series,
+                                            below_normal=lambda value: value < threshold_normal,
+                                            in_drought=lambda value: value < threshold_drought,
+                                            user_spi=lambda d: (
+                                                float(gauge_series.iloc[:d].mean()) - threshold_normal
+                                            ) / (threshold_normal - threshold_drought),
+                                            user_mm=lambda d: float(gauge_series.iloc[:d].mean()),
+                                            threshold_normal=threshold_normal,
+                                            threshold_drought=threshold_drought,
+                                            units="mm"
+                                        )
+                                    except (FileNotFoundError, ValueError) as sdf_error:
+                                        st.warning(f"SDF assessment unavailable: {sdf_error}")
+                                else:
+                                    st.warning(
+                                        "SDF assessment unavailable because the local normal "
+                                        "threshold is not greater than the drought threshold."
+                                    )
+
                         else:
                             st.error("Cannot calculate status: There are no valid 12-month periods in your dataset.")
     
@@ -1366,4 +1631,30 @@ elif st.session_state["path"] == "chirps":
                     f"**{continuous_deficit_duration} months**. "
                     "The continuous deficit extends to the earliest "
                     "valid SPI-12 value in the record."
+                )
+
+            # Smith SDF return-period assessment for the CHIRPS SPI-12 series.
+            # Compared in SPI units; depths shown in CHIRPS mm using the CHIRPS thresholds above,
+            # so they match the user's CHIRPS rainfall and the chart.
+            if threshold_normal > threshold_drought > 0:
+                try:
+                    run_sdf_assessment(
+                        user_lat, user_lon, historical_spi_series,
+                        below_normal=lambda value: value < 0,
+                        in_drought=lambda value: value < -1,
+                        user_spi=lambda d: float(historical_spi_series.iloc[:d].mean()),
+                        user_mm=lambda d: float(
+                            monthly_df.loc[historical_spi_series.index[:d],
+                                           "Rolling_12_Month_Rainfall"].mean()
+                        ),
+                        threshold_normal=float(threshold_normal),
+                        threshold_drought=float(threshold_drought),
+                        units="mm (CHIRPS)"
+                    )
+                except (FileNotFoundError, ValueError) as sdf_error:
+                    st.warning(f"SDF assessment unavailable: {sdf_error}")
+            else:
+                st.warning(
+                    "SDF assessment unavailable because the CHIRPS normal threshold "
+                    "is not greater than the drought threshold at this location."
                 )
